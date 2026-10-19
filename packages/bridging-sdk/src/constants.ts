@@ -89,3 +89,30 @@ export const HISTORY_BLOCK_LOOKBACK: Record<number, bigint> = {
   122: 120000n,
   50: 300000n,
 }
+
+// Provider route matrix: specifies which bridge protocols support each route
+// Axelar only supports Celo (42220) <-> Ethereum (1).
+// LayerZero supports cross-chain routes across all supported chains (Celo, Fuse, Ethereum, XDC).
+export const PROVIDER_ROUTE_MATRIX: Record<number, Record<number, BridgeProtocol[]>> = {
+  42220: {
+    1: ["LAYERZERO", "AXELAR"],
+    122: ["LAYERZERO"],
+    50: ["LAYERZERO"],
+  },
+  1: {
+    42220: ["LAYERZERO", "AXELAR"],
+    122: ["LAYERZERO"],
+    50: ["LAYERZERO"],
+  },
+  122: {
+    42220: ["LAYERZERO"],
+    1: ["LAYERZERO"],
+    50: ["LAYERZERO"],
+  },
+  50: {
+    42220: ["LAYERZERO"],
+    1: ["LAYERZERO"],
+    122: ["LAYERZERO"],
+  },
+}
+

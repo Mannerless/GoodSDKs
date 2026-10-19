@@ -15,6 +15,7 @@ import {
   HISTORY_BLOCK_LOOKBACK,
   API_ENDPOINTS,
   FEE_MULTIPLIER,
+  PROVIDER_ROUTE_MATRIX,
 } from "./constants"
 import type {
   BridgeProtocol,
@@ -26,6 +27,7 @@ import type {
   ExecutedTransferEvent,
   EventOptions,
   TransactionStatus,
+  GranularTransactionStatus,
   GoodServerFeeResponse,
   LayerZeroScanResponse,
   AxelarscanResponse,
@@ -34,6 +36,8 @@ import type {
   BridgeQuoteResult,
   BridgeRequirement,
   BridgeStatus,
+  BridgeRouteLimits,
+  ProtocolFeeInfo,
 } from "./types"
 
 import { MESSAGE_PASSING_BRIDGE_ABI } from "./abi"
@@ -135,6 +139,89 @@ export class BridgingSDK {
         error: `Failed to check bridge limits: ${error instanceof Error ? error.message : "Unknown error"}`,
       }
     }
+  }
+
+  /**
+   * Retrieves the bridge limits configured on the contract (dailyLimit, txLimit, accountDailyLimit, minAmount, onlyWhitelisted).
+   */
+  async getBridgeLimits(chainId?: ChainId): Promise<BridgeRouteLimits> {
+    const targetChainId = chainId || this.currentChainId
+    const contractAddress = BRIDGE_CONTRACT_ADDRESSES[targetChainId]
+    if (!contractAddress) {
+      throw new Error(`Bridge contract not deployed on chain ${targetChainId}`)
+    }
+
+    const limits = (await this.publicClient.readContract({
+      address: contractAddress as Address,
+      abi: MESSAGE_PASSING_BRIDGE_ABI,
+      functionName: "bridgeLimits",
+    })) as [bigint, bigint, bigint, bigint, boolean]
+
+    return {
+      dailyLimit: limits[0],
+      txLimit: limits[1],
+      accountDailyLimit: limits[2],
+      minAmount: limits[3],
+      onlyWhitelisted: limits[4],
+    }
+  }
+
+  /**
+   * Reads on-chain protocol fee settings and calculates the protocol fee for a given amount.
+   * Protocol fee is charged in G$ (normalized 18 decimals) and deducted from the bridged amount.
+   */
+  async getProtocolFee(amount: bigint = 0n, chainId?: ChainId): Promise<ProtocolFeeInfo> {
+    const targetChainId = chainId || this.currentChainId
+    const contractAddress = BRIDGE_CONTRACT_ADDRESSES[targetChainId]
+    if (!contractAddress) {
+      throw new Error(`Bridge contract not deployed on chain ${targetChainId}`)
+    }
+
+    const [minFee, maxFee, feeBps] = (await this.publicClient.readContract({
+      address: contractAddress as Address,
+      abi: MESSAGE_PASSING_BRIDGE_ABI,
+      functionName: "bridgeFees",
+    })) as [bigint, bigint, bigint]
+
+    let protocolFee = (amount * feeBps) / 10000n
+    if (minFee > 0n && protocolFee < minFee) {
+      protocolFee = minFee
+    }
+    if (maxFee > 0n && protocolFee > maxFee) {
+      protocolFee = maxFee
+    }
+
+    return {
+      protocolFee,
+      feeBps,
+      minFee,
+      maxFee,
+    }
+  }
+
+  /**
+   * Returns which bridge protocols (Axelar, LayerZero) support the route between source and target chains.
+   */
+  static getAvailableProviders(fromChain: ChainId, toChain: ChainId): BridgeProtocol[] {
+    return PROVIDER_ROUTE_MATRIX[fromChain]?.[toChain] || []
+  }
+
+  getAvailableProviders(toChain: ChainId, fromChain?: ChainId): BridgeProtocol[] {
+    const sourceChain = fromChain || this.currentChainId
+    return BridgingSDK.getAvailableProviders(sourceChain, toChain)
+  }
+
+  /**
+   * Checks whether a specific bridge protocol supports the given chain pair.
+   */
+  static isRouteSupported(fromChain: ChainId, toChain: ChainId, protocol: BridgeProtocol): boolean {
+    const providers = BridgingSDK.getAvailableProviders(fromChain, toChain)
+    return providers.includes(protocol)
+  }
+
+  isRouteSupported(toChain: ChainId, protocol: BridgeProtocol, fromChain?: ChainId): boolean {
+    const sourceChain = fromChain || this.currentChainId
+    return BridgingSDK.isRouteSupported(sourceChain, toChain, protocol)
   }
 
   /**
@@ -358,7 +445,16 @@ export class BridgingSDK {
     const recipient = params.recipient || sender
     const requirements: BridgeRequirement[] = []
 
-    // 1. Route and Fee Check
+    // 1. Route Support Matrix Check
+    if (!BridgingSDK.isRouteSupported(fromChain, toChain, protocol)) {
+      requirements.push({
+        type: "route_unavailable",
+        message: `${protocol} does not support route from ${SUPPORTED_CHAINS[fromChain]?.name || fromChain} to ${SUPPORTED_CHAINS[toChain]?.name || toChain}`,
+      })
+      return { quote: null, needsApproval: false, canBridge: false, requirements }
+    }
+
+    // 2. Fee Estimate and Protocol Fee Calculation
     let feeEstimate: FeeEstimate
     try {
       feeEstimate = await this.estimateFee(toChain, protocol, fromChain)
@@ -370,7 +466,9 @@ export class BridgingSDK {
       return { quote: null, needsApproval: false, canBridge: false, requirements }
     }
 
-    // 2. Chain Match Check
+    const protocolFeeInfo = await this.getProtocolFee(amount, fromChain).catch(() => null)
+
+    // 3. Chain Match Check
     if (fromChain !== this.currentChainId) {
       requirements.push({
         type: "wrong_chain",
@@ -378,7 +476,7 @@ export class BridgingSDK {
       })
     }
 
-    // 3. Source Chain Balance Check (G$ + Native Fee)
+    // 4. Source Chain Balance Check (G$ + Native Fee)
     const [tokenBalance, nativeBalance, allowance] = await Promise.all([
       this.getG$Balance(sender),
       this.publicClient.getBalance({ address: sender }),
@@ -399,13 +497,32 @@ export class BridgingSDK {
       })
     }
 
-    // 4. Bridge Limits Check
-    const canBridgeResult = await this.canBridge(sender, amount, toChain)
+    // 5. Bridge Limits Check (on-chain limits and user eligibility)
+    const [canBridgeResult, routeLimits] = await Promise.all([
+      this.canBridge(sender, amount, toChain),
+      this.getBridgeLimits(fromChain).catch(() => null),
+    ])
+
     if (!canBridgeResult.isWithinLimit) {
       requirements.push({
         type: "exceeds_limit",
         message: canBridgeResult.error || "Bridge limits exceeded",
       })
+    }
+
+    if (routeLimits) {
+      if (routeLimits.minAmount > 0n && amount < routeLimits.minAmount) {
+        requirements.push({
+          type: "below_min_amount",
+          message: "Amount is below minimum bridge limit",
+        })
+      }
+      if (routeLimits.txLimit > 0n && amount > routeLimits.txLimit) {
+        requirements.push({
+          type: "exceeds_limit",
+          message: "Amount exceeds maximum per-transaction limit",
+        })
+      }
     }
 
     const needsApproval = allowance < amount
@@ -418,6 +535,8 @@ export class BridgingSDK {
       target: recipient,
       targetChainId: toChain,
       amount,
+      protocolFee: protocolFeeInfo?.protocolFee,
+      protocolFeeInfo: protocolFeeInfo || undefined,
     }
 
     return { quote, needsApproval, canBridge, requirements }
@@ -563,27 +682,63 @@ export class BridgingSDK {
   }
 
   /**
-   * Gets status from external explorers
+   * Gets status from external explorers with 4-step granular progress:
+   * submitted (1) -> message_sent (2) -> processing (3) -> completed (4), or failed
    */
   async getTransactionStatus(txHash: Hash, protocol: BridgeProtocol): Promise<TransactionStatus> {
     if (protocol === "LAYERZERO") {
       const resp = await fetch(`${API_ENDPOINTS.LAYERZERO_SCAN}/messages/tx/${txHash}`)
       const data: LayerZeroScanResponse = await resp.json()
-      if (!data.data?.[0]) return { status: "pending" }
+      if (!data.data?.[0]) return { status: "submitted", step: 1 }
       const msg = data.data[0]
+      const statusName = msg.status.name
+      let status: GranularTransactionStatus = "submitted"
+      let step: 1 | 2 | 3 | 4 = 1
+
+      if (statusName === "DELIVERED") {
+        status = "completed"
+        step = 4
+      } else if (statusName === "FAILED") {
+        status = "failed"
+      } else if (msg.destination?.tx?.txHash) {
+        status = "processing"
+        step = 3
+      } else {
+        status = "message_sent"
+        step = 2
+      }
+
       return {
-        status: msg.status.name === "DELIVERED" ? "completed" : "pending",
+        status,
+        step,
         srcTxHash: msg.source.tx.txHash,
-        dstTxHash: msg.destination?.tx.txHash,
+        dstTxHash: msg.destination?.tx?.txHash,
         timestamp: new Date(msg.created).getTime(),
       }
     } else {
       const resp = await fetch(`${API_ENDPOINTS.AXELARSCAN}/gmp?txHash=${txHash}`)
       const data: AxelarscanResponse = await resp.json()
-      if (!data.data?.[0]) return { status: "pending" }
+      if (!data.data?.[0]) return { status: "submitted", step: 1 }
       const tx = data.data[0]
+      let status: GranularTransactionStatus = "submitted"
+      let step: 1 | 2 | 3 | 4 = 1
+
+      if (tx.status === "executed") {
+        status = "completed"
+        step = 4
+      } else if (tx.status === "failed") {
+        status = "failed"
+      } else if (tx.destinationTxHash) {
+        status = "processing"
+        step = 3
+      } else {
+        status = "message_sent"
+        step = 2
+      }
+
       return {
-        status: tx.status === "executed" ? "completed" : "pending",
+        status,
+        step,
         srcTxHash: tx.sourceTxHash,
         dstTxHash: tx.destinationTxHash,
         timestamp: new Date(tx.createdAt).getTime(),
@@ -598,10 +753,12 @@ export class BridgingSDK {
   }
 
   async getBridgeConfig(address: Address): Promise<BridgeConfig> {
-    const [tokenBalance, nativeBalance, allowance] = await Promise.all([
+    const [tokenBalance, nativeBalance, allowance, routeLimits, protocolFees] = await Promise.all([
       this.getG$Balance(address),
       this.publicClient.getBalance({ address }),
       this.getAllowance(address).catch(() => 0n),
+      this.getBridgeLimits().catch(() => null),
+      this.getProtocolFee(0n).catch(() => null),
     ])
 
     return {
@@ -611,7 +768,8 @@ export class BridgingSDK {
       nativeBalance,
       allowance,
       fees: this.fees,
-      routeLimits: null, // Limits are checked per-route in getQuote
+      routeLimits,
+      protocolFees,
     }
   }
 

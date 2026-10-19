@@ -22,6 +22,13 @@ export interface BridgeRouteLimits {
   onlyWhitelisted: boolean
 }
 
+export interface ProtocolFeeInfo {
+  protocolFee: bigint
+  feeBps: bigint
+  minFee: bigint
+  maxFee: bigint
+}
+
 export interface BridgeConfig {
   supportedChains: Record<number, BridgeChain>
   currentChainId: ChainId
@@ -30,6 +37,7 @@ export interface BridgeConfig {
   allowance: bigint
   fees: GoodServerFeeResponse | null
   routeLimits: BridgeRouteLimits | null
+  protocolFees?: ProtocolFeeInfo | null
 }
 
 export interface BridgeQuote {
@@ -40,6 +48,8 @@ export interface BridgeQuote {
   targetChainId: ChainId
   amount: bigint
   adapterParams?: `0x${string}`
+  protocolFee?: bigint
+  protocolFeeInfo?: ProtocolFeeInfo
 }
 
 export interface BridgeQuoteResult {
@@ -126,8 +136,17 @@ export interface CanBridgeResult {
   currentUsage?: bigint
 }
 
+export type GranularTransactionStatus =
+  | "submitted"
+  | "message_sent"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "pending"
+
 export interface TransactionStatus {
-  status: "pending" | "completed" | "failed"
+  status: GranularTransactionStatus
+  step?: 1 | 2 | 3 | 4
   srcTxHash?: Hash
   dstTxHash?: Hash
   timestamp?: number

@@ -10,6 +10,7 @@ export type {
   ExecutedTransferEvent,
   EventOptions,
   TransactionStatus,
+  GranularTransactionStatus,
   BridgeTransaction,
   FeeEstimate,
   CanBridgeResult,
@@ -19,6 +20,7 @@ export type {
   BridgeRequirement,
   BridgeRequirementType,
   BridgeRouteLimits,
+  ProtocolFeeInfo,
   BridgeStatus,
   GoodServerFeeResponse,
   LayerZeroScanResponse,
@@ -34,4 +36,8 @@ export {
   BRIDGE_PROTOCOLS,
   API_ENDPOINTS,
   BRIDGE_CONTRACT_ADDRESSES,
+  PROVIDER_ROUTE_MATRIX,
 } from "./constants"
+
+// ABI
+export { MESSAGE_PASSING_BRIDGE_ABI } from "./abi"
